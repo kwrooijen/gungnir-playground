@@ -1,0 +1,13 @@
+version: "2"
+
+services:
+  db:
+    container_name: gungnir-demo
+    image: postgres:9.4.8
+    environment:
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_USER=postgres
+    ports:
+      - "7432:5432"
+    expose:
+      - 5432
