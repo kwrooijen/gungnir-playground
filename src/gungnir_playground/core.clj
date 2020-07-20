@@ -75,7 +75,7 @@
 (def post-table-migration
   "Create a `post` table.
 
-  Relations :
+  Relations :be
   * post has_many comment
   * post belongs_to user
   * user has_many post
@@ -90,6 +90,25 @@
    " , updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL "
    " );"))
 
+(def comment-table-migration
+  "Create a `comment` table.
+
+  Relations :be
+  * comment belongs_to post
+  * comment belongs_to user
+  * post has_many comment
+  * user has_many comment
+  "
+  (str
+   "CREATE TABLE IF NOT EXISTS comment "
+   " ( id uuid DEFAULT uuid_generate_v4 () PRIMARY KEY "
+   " , content TEXT "
+   " , user_id uuid references \"user\"(id)"
+   " , post_id uuid references post(id)"
+   " , created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL "
+   " , updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL "
+   " );"))
+
 (defn migrate!
   "Run migrations to create all tables. The migrations are idempotent,
   so they can be run multiple times in this demo without change."
@@ -97,7 +116,8 @@
   (execute-one! *database* [uuid-extension-migration])
   (execute-one! *database* [trigger-updated-at-migration])
   (execute-one! *database* [user-table-migration])
-  (execute-one! *database* [post-table-migration]))
+  (execute-one! *database* [post-table-migration])
+  (execute-one! *database* [comment-table-migration]))
 
 (comment
   ;; Run the migrations
@@ -228,7 +248,7 @@
 
 (comment
   ;; Create 3 users
-  (-> {:user/email "user-1@mail.com" :user/password "qweqwe"} (changeset) (q/insert!))
+  (-> {:user/email "user@mail.com" :user/password "qweqwe"} (changeset) (q/insert!))
   (-> {:user/email "user-2@mail.com" :user/password "qweqwe"} (changeset) (q/insert!))
   (-> {:user/email "user-3@mail.com" :user/password "qweqwe"} (changeset) (q/insert!))
 
@@ -337,20 +357,42 @@
   )
 
 
-
-
-
-
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; FINAL
+;; You can also create custom hooks. For example you'd never want to save a
+;; password unencrypted to the database.
 
 (comment
   (defmethod gungnir/model :user [_]
     [:map
-     {:has-many {:post :user/posts}}
+     [:user/id {:primary-key true} uuid?]
+     [:user/email {:on-save [:string/lower-case]
+                   :before-read [:string/lower-case]}
+      [:re {:error/message "Invalid email"} #".+@.+\..+"]]
+     ;; >>> ADD `:on-save` `:bcrypt'
+     [:user/password {:on-save [:bcrypt]} [:string {:min 6}]]
+     [:user/password-confirmation {:virtual true} [:string {:min 6}]]
+     [:user/created-at {:auto true} inst?]
+     [:user/updated-at {:auto true} inst?]])
+
+  ;; Define our custom `gungnir/on-save` hook. Where `v` is the value of the
+  ;; column. Here we simple `buddy.hashers/derive` function to encrypt the value
+  (defmethod gungnir/on-save :bcrypt [_ v]
+    (hashers/derive v))
+
+  (-> {:user/email "encrypted@mail.com" :user/password "secret!"} (changeset) (q/insert!))
+  ;; => #:user{:password "bcrypt+sha512$387a0d10115bb66c98c2a4b908f77e1e,,," ,,,}
+  )
+
+
+;; [Relations]
+;;
+;;
+
+(comment
+  (defmethod gungnir/model :user [_]
+    [:map
+     ;; >>> ADD `:has-many` relation to `:post`
+     {:has-many {:post :user/posts
+                 :comment :user/comments}}
      [:user/id {:primary-key true} uuid?]
      [:user/email {:on-save [:string/lower-case]
                    :before-read [:string/lower-case]}
@@ -360,17 +402,109 @@
      [:user/created-at {:auto true} inst?]
      [:user/updated-at {:auto true} inst?]])
 
-  (defn password-match? [m]
-    (= (:user/password m)
-       (:user/password-confirmation m)))
+  ;; Define a `:post` model. We'll keep it simple. The only exceptional line
+  ;; here is the `:belongs-to` property.
+  (defmethod gungnir/model :post [_]
+    [:map
+     {:belongs-to {:user :post/user-id}
+      :has-many {:comment :post/comments}
+      }
+     [:post/id {:primary-key true} uuid?]
+     [:post/title string?]
+     [:post/content string?]
+     [:post/user-id uuid?]
+     [:post/created-at {:auto true} inst?]
+     [:post/updated-at {:auto true} inst?]])
 
-  (defmethod gungnir/validator [:user :register/password-match?] [_ _]
-    {:validator/path [:user/password-confirmation]
-     :validator/fn password-match?
-     :validator/message "Passwords don't match"})
+  (defmethod gungnir/model :comment [_]
+    [:map
+     {:belongs-to {:user :comment/user-id
+                   :post :comment/post-id}}
+     [:comment/id {:primary-key true} uuid?]
+     [:comment/content string?]
+     [:comment/user-id uuid?]
+     [:comment/post-id uuid?]
+     [:comment/created-at {:auto true} inst?]
+     [:comment/updated-at {:auto true} inst?]])
+  ;;
+  )
 
-  (defmethod gungnir/format-error [:user/email :duplicate-key] [_ _]
-    "already exists")
+(defn create-user [email]
+  (-> {:user/email email
+       :user/password "qweqwe"}
+      (changeset)
+      (q/insert!)))
 
-  (defmethod gungnir/on-save :bcrypt [_ v]
-    (hashers/derive v)))
+(defn create-comment [user-id post-id content]
+  (-> {:comment/user-id user-id
+       :comment/post-id post-id
+       :comment/content content}
+      (changeset)
+      (q/insert!)))
+
+(defn create-post [user-id title content]
+  (-> {:post/user-id user-id
+       :post/title title
+       :post/content content}
+      (changeset)
+      (q/insert!)))
+
+(defn create-user-with-posts-comments
+  "Create a user with the email `email`, and create 3 posts that belong to that user."
+  [email]
+  (let [user (create-user email)]
+    (let [post (create-post (:user/id user) "post-1" "content-1")]
+      (create-comment (:user/id user) (:post/id post) "comment-1-1")
+      (create-comment (:user/id user) (:post/id post) "comment-1-2"))
+    (let [post (create-post (:user/id user) "post-2" "content-2")]
+      (create-comment (:user/id user) (:post/id post) "comment-2-1")
+      (create-comment (:user/id user) (:post/id post) "comment-2-2")
+      (create-comment (:user/id user) (:post/id post) "comment-2-3"))
+    (let [post (create-post (:user/id user) "post-3" "content-3")]
+      (create-comment (:user/id user) (:post/id post) "comment-3-1")
+      (create-comment (:user/id user) (:post/id post) "comment-3-2")
+      (create-comment (:user/id user) (:post/id post) "comment-3-3"))))
+
+(comment
+  (create-user-with-posts-comments "user-posts@mail.com")
+
+  ;; Find a user by the given email. Select the `:user/posts` key, and deref it
+  ;; to retrieve all of the users posts.
+  (-> (q/find-by! :user/email "user-posts@mail.com")
+      :user/posts
+      (deref))
+
+  ;; Once again, Gungnir is based on HoneySQL, so we can modify the relational
+  ;; atom's query with `swap!`. For example let's say we wanted to limit it to
+  ;; two posts instead of all posts.
+
+  (-> (q/find-by! :user/email "user-posts@mail.com")
+      :user/posts
+      (swap! q/limit 2)
+      (deref)
+      (count))
+  ;; => 2
+
+
+  ;; We can also go back from a post to the user it belongs to, the same way.
+  (-> (q/find-by! :user/email "user-posts@mail.com")
+      :user/posts
+      ;; Get the user's posts
+      (deref)
+      (first)
+      :post/user
+      ;; Get the post's user
+      (deref))
+
+  ;; Get all comments of the user's first post
+  (-> (q/find-by! :user/email "user-posts@mail.com")
+      :user/posts
+      (deref)
+      (first)
+      (:post/comments)
+      (deref))
+
+  ;; Get all comments of the user
+  (-> (q/find-by! :user/email "user-posts@mail.com")
+      :user/comments
+      (deref)))
