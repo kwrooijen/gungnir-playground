@@ -85,13 +85,9 @@
    " ( id uuid DEFAULT uuid_generate_v4 () PRIMARY KEY "
    " , title TEXT "
    " , content TEXT "
-   " , user_id uuid "
+   " , user_id uuid references \"user\"(id)"
    " , created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL "
    " , updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL "
-   " , CONSTRAINT fk_user "
-   " FOREIGN KEY(user_id) "
-   " REFERENCES \"user\"(id) "
-   " ON DELETE SET NULL"
    " );"))
 
 (defn migrate!
@@ -125,14 +121,17 @@
 ;; Gungnir. This is useful for for any columns that are filled in
 ;; automatically. For example `created_at` and `updated_at`.
 
-(defmethod gungnir/model :user [_]
-  [:map
-   [:user/id {:primary-key true} uuid?]
-   [:user/email
-    [:re {:error/message "Invalid email"} #".+@.+\..+"]]
-   [:user/password [:string {:min 6}]]
-   [:user/created-at {:auto true} inst?]
-   [:user/updated-at {:auto true} inst?]])
+(comment
+  (defmethod gungnir/model :user [_]
+    [:map
+     [:user/id {:primary-key true} uuid?]
+     [:user/email
+      [:re {:error/message "Invalid email"} #".+@.+\..+"]]
+     [:user/password [:string {:min 6}]]
+     [:user/created-at {:auto true} inst?]
+     [:user/updated-at {:auto true} inst?]])
+  ;;
+  )
 
 ;; [Changesets]
 ;;
@@ -198,16 +197,154 @@
   ;;           :updated-at #inst "2020-07-20T20:20:06.112492000-00:00"}
   )
 
+;; [Query]
+;;
+;; Querying is primarily done with the following three functions
+;;
+;; * q/find!
+;; Return a single record by its primary key. Or return nil.
+;;
+;; * q/find-by!
+;; Return a single record which match specific key / values, or of `table`. Or
+;; return nil
+;;
+;; * q/all!
+;; Return a multiple records which match specific key / values, or of
+;; `table`. Or return an empty vector
 
+(comment
+  (q/find! :user "insert-primary-key-of-user")
 
+  (q/find-by! :user/email "foo@bar.baz")
+  ;; => #:user{:email "foo@bar.baz" ,,,}
 
+  (q/all! :user/email "foo@bar.baz")
+  ;; => [#:user{:email "foo@bar.baz" ,,,}]
+  )
 
+;; Since Gungnir is based on HoneySQL, we can modify these queries beforehand,
+;; extending them as needed. The `gungnir.query` namespace has aliases to
+;; HoneySQL helpers, so you don't need to require that separately.
 
+(comment
+  ;; Create 3 users
+  (-> {:user/email "user-1@mail.com" :user/password "qweqwe"} (changeset) (q/insert!))
+  (-> {:user/email "user-2@mail.com" :user/password "qweqwe"} (changeset) (q/insert!))
+  (-> {:user/email "user-3@mail.com" :user/password "qweqwe"} (changeset) (q/insert!))
+
+  ;; Note, using the `:user` table instead of key value pairs
+  (-> (q/limit 2)
+      (q/order-by [:user/email :desc])
+      (q/all! :user))
+  ;; => [#:user{:email "user-3@mail.com" ,,,}
+  ;;     #:user{:email "user-2@mail.com" ,,,}]
+  )
+
+;; [Validators]
+;;
+;; Validators are extra, map wide validations. Since Malli fields are isolated
+;; from eachother, we need a way to compare them in specific cases. Validators
+;; can be added to changesets for extra custom checks.
+;; Validators are maps which take three keys.
+;;
+;; * :validator/path (TODO rename to `:validator/key`)
+;; Path to the key in the map. This will be used for mapping errors.
+;;
+;; * :validator/fn
+;; The function to check the validation. If this function return `true`, then
+;; the validation passes. If it returns `false`. It has failed, and the
+;; changeset will return this validator in the `:changeset/errors` key
+;;
+;; * :validator/message
+;; In case of validation failure, this message will appear in `:changeset/errors`
 ;;
 ;;
+;; Field options:
 ;;
+;; * :virtual A key which is part of a model, but not stored in the
+;; database. This can be used for certain validations such as password
+;; confirmation checks.
+
+(comment
+  (defmethod gungnir/model :user [_]
+    [:map
+     [:user/id {:primary-key true} uuid?]
+     [:user/email
+      [:re {:error/message "Invalid email"} #".+@.+\..+"]]
+     [:user/password [:string {:min 6}]]
+     ;; >>> ADD `:user/password-confirmation`
+     [:user/password-confirmation {:virtual true} [:string {:min 6}]]
+     [:user/created-at {:auto true} inst?]
+     [:user/updated-at {:auto true} inst?]])
+
+  (defn- password-match? [m]
+    (= (:user/password m)
+       (:user/password-confirmation m)))
+
+  ;; Define Gungnir validator. Model `:user` and validator `:register/password-match?`
+  (defmethod gungnir/validator [:user :register/password-match?] [_ _]
+    {:validator/path [:user/password-confirmation]
+     :validator/fn password-match?
+     :validator/message "Passwords don't match"})
+
+  (-> {:user/email "foo@bar.baz"
+       :user/password "qweqwe"
+       :user/password-confirmation "123123"}
+      (changeset [:register/password-match?])
+      :changeset/errors)
+  ;; => #:user{:password-confirmation ["Passwords don't match"]}
+  )
+
+
+;; [Hooks]
+;;
+;; Sometimes you want to modify certain fields before or after saving / reading
+;; them. This can be done with the following hooks
+;;
+;; * gungnir/on-save (TODO RENAME before-save)
+;;
+;; Modify the column value before saving to the database.
+;;
+;; * gungnir/on-read (TODO RENAME after-read)
+;;
+;; Modify the column value after reading from the database.
+;;
+;; * gungnir/before-read
+;;
+;; Modify the column value before reading from the database.
 ;;
 
+(comment
+  (defmethod gungnir/model :user [_]
+    [:map
+     [:user/id {:primary-key true} uuid?]
+     ;; >>> ADD `:on-save` `:before-read` hooks
+     ;; always lowercase `:user/email` when reading / writing
+     [:user/email {:on-save [:string/lower-case]
+                   :before-read [:string/lower-case]}
+      [:re {:error/message "Invalid email"} #".+@.+\..+"]]
+     [:user/password [:string {:min 6}]]
+     [:user/password-confirmation {:virtual true} [:string {:min 6}]]
+     [:user/created-at {:auto true} inst?]
+     [:user/updated-at {:auto true} inst?]])
+
+  ;; Now regardless of uppercase / lowercase letters, emails will always be cast
+  ;; to lowercase. When writing and reading.
+  (-> {:user/email "SomE-UseR@mAiL.cOM" :user/password "qweqwe"} (changeset) (q/insert!))
+  (q/find-by! :user/email "some-USER@MAIL.com")
+  (q/find-by! :user/email "some-user@mail.com")
+  ;;
+  )
+
+
+
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; FINAL
 
 (comment
