@@ -1,4 +1,239 @@
 (ns gungnir-playground.core
   (:require
-   [gungnir.core :refer [changeset]]
-   [gungnir.query :as q]))
+   [buddy.hashers :as hashers]
+   [gungnir.core :as gungnir :refer [changeset]]
+   [gungnir.db :refer [make-datasource! *database*]]
+   [gungnir.query :as q]
+   [next.jdbc :refer [execute-one!]]))
+
+;; Initial setup.
+
+;; Gungnir `make-datasource!` supports the following values
+;; * DATABASE_URL - The universal database url used by services such as Heroku / Render
+;; * JDBC_DATABASE_URL - The standard Java Database Connectivity URL
+;; * HikariCP configuration map - https://github.com/tomekw/hikari-cp#configuration-options
+
+;; Gunir also has a `set-datasource!` function, if you want to create the
+;; datasource yoursef.
+
+(def datasource-opts
+  "Very simple HikariCP configuration map. Be sure to start the
+  Postgresl Docker container by running `docker-compose up -d` in the
+  root directory.
+
+  Configuration options:
+  https://github.com/tomekw/hikari-cp#configuration-options"
+  {:adapter            "postgresql"
+   :username           "postgres"
+   :password           "postgres"
+   :database-name      "postgres"
+   :server-name        "localhost"
+   :port-number        7432})
+
+;; Initialize the datasource. Put it in a defonce for this demo so that it only
+;; gets evaluated once. Normally you'd want to manage this through a state
+;; manager like Integrant, Component, or Mount
+(defonce _ (make-datasource! datasource-opts))
+
+;; Migrations
+
+;; Currently Gungnir does not support migrations (future feature). In this demo
+;; we'll simply run next-jdbc queries. You'd want to use an actual migration
+;; library such as Ragtime.
+
+(def uuid-extension-migration
+  "Add the `uuid-ossp` extension for UUID support"
+  "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";")
+
+(def trigger-updated-at-migration
+  "Add trigger for the `updated_at` field to set its value to `NOW()`
+  whenever this row changes. This is so you don't have to do it
+  manually, and can be useful information."
+  (str
+   "CREATE OR REPLACE FUNCTION trigger_set_updated_at() "
+   "RETURNS TRIGGER AS $$ "
+   "BEGIN "
+   "  NEW.updated_at = NOW(); "
+   "  RETURN NEW; "
+   "END; "
+   "$$ LANGUAGE plpgsql;"))
+
+(def user-table-migration
+  "Create a `user` table. Note that the `user` table can't be used in
+  Postgres since it is used internally. We can create our own `user`
+  table by wrapping it in double quotes. Gungnir handles selecting the
+  proper table for you by always double quoting table names."
+  (str
+   "CREATE TABLE IF NOT EXISTS \"user\" "
+   " ( id uuid DEFAULT uuid_generate_v4 () PRIMARY KEY "
+   " , email TEXT NOT NULL UNIQUE "
+   " , password TEXT NOT NULL "
+   " , created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL "
+   " , updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL "
+   " );"))
+
+(def post-table-migration
+  "Create a `post` table.
+
+  Relations :
+  * post has_many comment
+  * post belongs_to user
+  * user has_many post
+  "
+  (str
+   "CREATE TABLE IF NOT EXISTS post "
+   " ( id uuid DEFAULT uuid_generate_v4 () PRIMARY KEY "
+   " , title TEXT "
+   " , content TEXT "
+   " , user_id uuid "
+   " , created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL "
+   " , updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL "
+   " , CONSTRAINT fk_user "
+   " FOREIGN KEY(user_id) "
+   " REFERENCES \"user\"(id) "
+   " ON DELETE SET NULL"
+   " );"))
+
+(defn migrate!
+  "Run migrations to create all tables. The migrations are idempotent,
+  so they can be run multiple times in this demo without change."
+  []
+  (execute-one! *database* [uuid-extension-migration])
+  (execute-one! *database* [trigger-updated-at-migration])
+  (execute-one! *database* [user-table-migration])
+  (execute-one! *database* [post-table-migration]))
+
+(comment
+  ;; Run the migrations
+  (migrate!)
+  ;; => #:next.jdbc{:update-count 0}
+  )
+
+;; [Models]
+;;
+;; Now that we've defined our Postgresql database structure, we now need to
+;; describe it to Gungnir. This is done using Malli schemas and the defmethod
+;; `gungnir/model`. Each table has their own model which describe their
+;; fields. Extra Gungnir specific model / field options can be added.
+;;
+;; Field options:
+;;
+;; * :primary-key - Tells Gungnir that this is the primary key of the
+;; Model. Every model must always have 1 primary key defined
+;;
+;; * :auto - Any field with the `:auto` key will not be modified by
+;; Gungnir. This is useful for for any columns that are filled in
+;; automatically. For example `created_at` and `updated_at`.
+
+(defmethod gungnir/model :user [_]
+  [:map
+   [:user/id {:primary-key true} uuid?]
+   [:user/email
+    [:re {:error/message "Invalid email"} #".+@.+\..+"]]
+   [:user/password [:string {:min 6}]]
+   [:user/created-at {:auto true} inst?]
+   [:user/updated-at {:auto true} inst?]])
+
+;; [Changesets]
+;;
+;; Changesets are used to validate, create, and update rows.  Gungnir uses
+;; qualified keywords to determine which model to use. e.g. if a record has the
+;; key `:user/email`, it will use the `:user` model. If it has the `:post/title`
+;; key, it will use the `:post` model.
+;;
+;; * Validation: Make sure that all data in a changeset is correct,
+;; conforming to the model you describe. If a changeset is invalid, it will have
+;; a key `:changeset/errors` containing the failing key with an error message.
+
+(comment
+  (changeset {:user/email "foo@bar.baz"
+              :user/password "qweqw"})
+  ;; => #:changeset{:errors {:user/password ["should be at least 6 characters"]} ,,, }
+
+  (changeset {:user/email "foo@bar.baz"
+              :user/password "qweqwe"})
+  ;; => #:changeset{:errors nil ,,, }
+  )
+
+;; * External
+;;
+;; In the real world you will be receiving datastructures from outside of your
+;; application. Often this data will also not be the same format as your
+;; model (not qualified keywords, underscores instead of dashes). Gungnir adds a
+;; `gungnir/cast` function to cast a map to a specific model map. It'll also
+;; filter out any keys that are unknown to that model.
+
+(comment
+  (-> {"email" "foo@bar.baz"
+       "password" "qweqwe"}
+      (gungnir/cast :user))
+  ;; => #:user{:email "foo@bar.baz", :password "qweqwe"}
+
+  (-> {"email" "foo@bar.baz"
+       "password" "qweqwe"
+       "unknown-key" 123}
+      (gungnir/cast :user))
+  ;; => #:user{:email "foo@bar.baz", :password "qweqwe"}
+  )
+
+;; * Saving: If the `:changeset/errors` key is `nil` then you are ready to save
+;; the changeset. Trying to save an invalid changeset will simply return the
+;; changeset again without changing the database. If the changeset has no
+;; errors, and the insertion is successful, it will return the newly created
+;; row.
+
+(comment
+  (q/insert!
+   (changeset {:user/email "foo@bar.baz"
+               :user/password "qweqw"}))
+  ;; => #:changeset{:errors {:user/password ["should be at least 6 characters"]} ,,, }
+
+  (q/insert!
+   (changeset {:user/email "foo@bar.baz"
+               :user/password "qweqwe"}))
+  ;; => #:user{:id #uuid "a73b46cc-2848-4405-a819-b6e8738007ef",
+  ;;           :email "foo@bar.baz",
+  ;;           :password "qweqwe",
+  ;;           :created-at #inst "2020-07-20T20:20:06.112492000-00:00",
+  ;;           :updated-at #inst "2020-07-20T20:20:06.112492000-00:00"}
+  )
+
+
+
+
+
+
+;;
+;;
+;;
+;;
+
+;; FINAL
+
+(comment
+  (defmethod gungnir/model :user [_]
+    [:map
+     {:has-many {:post :user/posts}}
+     [:user/id {:primary-key true} uuid?]
+     [:user/email {:on-save [:string/lower-case]
+                   :before-read [:string/lower-case]}
+      [:re {:error/message "Invalid email"} #".+@.+\..+"]]
+     [:user/password {:on-save [:bcrypt]} [:string {:min 6}]]
+     [:user/password-confirmation {:virtual true} [:string {:min 6}]]
+     [:user/created-at {:auto true} inst?]
+     [:user/updated-at {:auto true} inst?]])
+
+  (defn password-match? [m]
+    (= (:user/password m)
+       (:user/password-confirmation m)))
+
+  (defmethod gungnir/validator [:user :register/password-match?] [_ _]
+    {:validator/path [:user/password-confirmation]
+     :validator/fn password-match?
+     :validator/message "Passwords don't match"})
+
+  (defmethod gungnir/format-error [:user/email :duplicate-key] [_ _]
+    "already exists")
+
+  (defmethod gungnir/on-save :bcrypt [_ v]
+    (hashers/derive v)))
