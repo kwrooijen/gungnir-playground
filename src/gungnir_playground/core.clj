@@ -267,8 +267,8 @@
 ;; can be added to changesets for extra custom checks.
 ;; Validators are maps which take three keys.
 ;;
-;; * :validator/path (TODO rename to `:validator/key`)
-;; Path to the key in the map. This will be used for mapping errors.
+;; * :validator/key
+;; The the field's key in the map. This will be used for mapping errors.
 ;;
 ;; * :validator/fn
 ;; The function to check the validation. If this function return `true`, then
@@ -321,7 +321,7 @@
 ;; Sometimes you want to modify certain fields before or after saving / reading
 ;; them. This can be done with the following hooks
 ;;
-;; * gungnir/on-save (TODO RENAME before-save)
+;; * gungnir/before-save
 ;;
 ;; Modify the column value before saving to the database.
 ;;
@@ -407,8 +407,7 @@
   (defmethod gungnir/model :post [_]
     [:map
      {:belongs-to {:user :post/user-id}
-      :has-many {:comment :post/comments}
-      }
+      :has-many {:comment :post/comments}}
      [:post/id {:primary-key true} uuid?]
      [:post/title string?]
      [:post/content string?]
