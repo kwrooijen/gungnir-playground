@@ -2,7 +2,7 @@ version: "2"
 
 services:
   db:
-    container_name: gungnir-demo
+    container_name: gungnir-playground
     image: postgres:9.4.8
     environment:
       - POSTGRES_PASSWORD=postgres
