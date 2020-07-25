@@ -1,13 +1,17 @@
 (ns gungnir-playground.core
   (:require
    [buddy.hashers :as hashers]
-   [gungnir.core :as gungnir :refer [changeset]]
-   [gungnir.db :refer [make-datasource! *database*]]
+   [ragtime.jdbc]
+   [ragtime.repl]
+   [gungnir.changeset :refer [changeset]]
+   [gungnir.database :refer [make-datasource! *database*]]
    [gungnir.query :as q]
-   [next.jdbc :refer [execute-one!]]))
+   [gungnir.model]
+   [ragtime.core]))
 
-;; Initial setup.
-
+;;
+;; [Database]
+;;
 ;; Gungnir `make-datasource!` supports the following values
 ;; * DATABASE_URL - The universal database url used by services such as Heroku / Render
 ;; * JDBC_DATABASE_URL - The standard Java Database Connectivity URL
@@ -23,108 +27,52 @@
 
   Configuration options:
   https://github.com/tomekw/hikari-cp#configuration-options"
-  {:adapter            "postgresql"
-   :username           "postgres"
-   :password           "postgres"
-   :database-name      "postgres"
-   :server-name        "localhost"
-   :port-number        7432})
+  {:adapter       "postgresql"
+   :username      "postgres"
+   :password      "postgres"
+   :database-name "postgres"
+   :server-name   "localhost"
+   :port-number   7432})
 
-;; Initialize the datasource. Put it in a defonce for this demo so that it only
-;; gets evaluated once. Normally you'd want to manage this through a state
-;; manager like Integrant, Component, or Mount
-(defonce _ (make-datasource! datasource-opts))
+;; Initialize the datasource.  Normally you'd want to manage this through a
+;; state manager like Integrant, Component, or Mount
 
-;; Migrations
+(comment
+  (make-datasource! datasource-opts))
 
-;; Currently Gungnir does not support migrations (future feature). In this demo
-;; we'll simply run next-jdbc queries. You'd want to use an actual migration
-;; library such as Ragtime.
+;;
+;; [Migrations]
+;;
+;; Currently Gungnir does not a built-in migrations tool (future feature). In
+;; this demo we'll use Ragtime.
+;;
+;; Migrations are located in gungnir_playground/resources/migrations
+;;
+;; The following migrations will be run:
+;; * Enable UUID
+;; * Enable auto updating of the `updated_at` column
+;; * Create "user" table
+;; * Create "post" table
+;; * Create "comment" table
+;;
+;; Relations
+;; * comment belongs_to post
+;; * comment belongs_to user
+;; * post belongs_to user
+;; * post has_many comment
+;; * user has_many comment
+;; * user has_many post
 
-(def uuid-extension-migration
-  "Add the `uuid-ossp` extension for UUID support"
-  "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";")
-
-(def trigger-updated-at-migration
-  "Add trigger for the `updated_at` field to set its value to `NOW()`
-  whenever this row changes. This is so you don't have to do it
-  manually, and can be useful information."
-  (str
-   "CREATE OR REPLACE FUNCTION trigger_set_updated_at() "
-   "RETURNS TRIGGER AS $$ "
-   "BEGIN "
-   "  NEW.updated_at = NOW(); "
-   "  RETURN NEW; "
-   "END; "
-   "$$ LANGUAGE plpgsql;"))
-
-(def user-table-migration
-  "Create a `user` table. Note that the `user` table can't be used in
-  Postgres since it is used internally. We can create our own `user`
-  table by wrapping it in double quotes. Gungnir handles selecting the
-  proper table for you by always double quoting table names."
-  (str
-   "CREATE TABLE IF NOT EXISTS \"user\" "
-   " ( id uuid DEFAULT uuid_generate_v4 () PRIMARY KEY "
-   " , email TEXT NOT NULL UNIQUE "
-   " , password TEXT NOT NULL "
-   " , created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL "
-   " , updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL "
-   " );"))
-
-(def post-table-migration
-  "Create a `post` table.
-
-  Relations :be
-  * post has_many comment
-  * post belongs_to user
-  * user has_many post
-  "
-  (str
-   "CREATE TABLE IF NOT EXISTS post "
-   " ( id uuid DEFAULT uuid_generate_v4 () PRIMARY KEY "
-   " , title TEXT "
-   " , content TEXT "
-   " , user_id uuid references \"user\"(id)"
-   " , created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL "
-   " , updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL "
-   " );"))
-
-(def comment-table-migration
-  "Create a `comment` table.
-
-  Relations :be
-  * comment belongs_to post
-  * comment belongs_to user
-  * post has_many comment
-  * user has_many comment
-  "
-  (str
-   "CREATE TABLE IF NOT EXISTS comment "
-   " ( id uuid DEFAULT uuid_generate_v4 () PRIMARY KEY "
-   " , content TEXT "
-   " , user_id uuid references \"user\"(id)"
-   " , post_id uuid references post(id)"
-   " , created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL "
-   " , updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL "
-   " );"))
-
-(defn migrate!
-  "Run migrations to create all tables. The migrations are idempotent,
-  so they can be run multiple times in this demo without change."
-  []
-  (execute-one! *database* [uuid-extension-migration])
-  (execute-one! *database* [trigger-updated-at-migration])
-  (execute-one! *database* [user-table-migration])
-  (execute-one! *database* [post-table-migration])
-  (execute-one! *database* [comment-table-migration]))
+(defn migrate! []
+  (ragtime.repl/migrate
+   {:datastore (ragtime.jdbc/sql-database {:datasource *database*})
+    :migrations (ragtime.jdbc/load-resources "migrations")}))
 
 (comment
   ;; Run the migrations
-  (migrate!)
-  ;; => #:next.jdbc{:update-count 0}
-  )
+  (migrate!))
 
+;;
 ;; [Models]
 ;;
 ;; Now that we've defined our Postgresql database structure, we now need to
@@ -142,20 +90,19 @@
 ;; automatically. For example `created_at` and `updated_at`.
 
 (comment
-  (defmethod gungnir/model :user [_]
+  (gungnir.model/register!
+   {:user
     [:map
      [:user/id {:primary-key true} uuid?]
      [:user/email
       [:re {:error/message "Invalid email"} #".+@.+\..+"]]
      [:user/password [:string {:min 6}]]
      [:user/created-at {:auto true} inst?]
-     [:user/updated-at {:auto true} inst?]])
-  ;;
-  )
+     [:user/updated-at {:auto true} inst?]]}))
 
 ;; [Changesets]
 ;;
-;; Changesets are used to validate, create, and update rows.  Gungnir uses
+;; Changesets are used to validate, create, and update rows. Gungnir uses
 ;; qualified keywords to determine which model to use. e.g. if a record has the
 ;; key `:user/email`, it will use the `:user` model. If it has the `:post/title`
 ;; key, it will use the `:post` model.
@@ -185,13 +132,13 @@
 (comment
   (-> {"email" "foo@bar.baz"
        "password" "qweqwe"}
-      (gungnir/cast :user))
+      (gungnir.changeset/cast :user))
   ;; => #:user{:email "foo@bar.baz", :password "qweqwe"}
 
   (-> {"email" "foo@bar.baz"
        "password" "qweqwe"
        "unknown-key" 123}
-      (gungnir/cast :user))
+      (gungnir.changeset/cast :user))
   ;; => #:user{:email "foo@bar.baz", :password "qweqwe"}
   )
 
@@ -202,12 +149,12 @@
 ;; row.
 
 (comment
-  (q/insert!
+  (q/save!
    (changeset {:user/email "foo@bar.baz"
                :user/password "qweqw"}))
   ;; => #:changeset{:errors {:user/password ["should be at least 6 characters"]} ,,, }
 
-  (q/insert!
+  (q/save!
    (changeset {:user/email "foo@bar.baz"
                :user/password "qweqwe"}))
   ;; => #:user{:id #uuid "a73b46cc-2848-4405-a819-b6e8738007ef",
@@ -217,6 +164,7 @@
   ;;           :updated-at #inst "2020-07-20T20:20:06.112492000-00:00"}
   )
 
+;;
 ;; [Query]
 ;;
 ;; Querying is primarily done with the following three functions
@@ -233,7 +181,7 @@
 ;; `table`. Or return an empty vector
 
 (comment
-  (q/find! :user "insert-primary-key-of-user")
+  (q/find! :user #"insert-primary-key-of-user")
 
   (q/find-by! :user/email "foo@bar.baz")
   ;; => #:user{:email "foo@bar.baz" ,,,}
@@ -248,18 +196,19 @@
 
 (comment
   ;; Create 3 users
-  (-> {:user/email "user@mail.com" :user/password "qweqwe"} (changeset) (q/insert!))
-  (-> {:user/email "user-2@mail.com" :user/password "qweqwe"} (changeset) (q/insert!))
-  (-> {:user/email "user-3@mail.com" :user/password "qweqwe"} (changeset) (q/insert!))
+  (-> {:user/email "user-1@mail.com" :user/password "qweqwe"} (changeset) (q/save!))
+  (-> {:user/email "user-2@mail.com" :user/password "qweqwe"} (changeset) (q/save!))
+  (-> {:user/email "user-3@mail.com" :user/password "qweqwe"} (changeset) (q/save!))
 
   ;; Note, using the `:user` table instead of key value pairs
-  (-> (q/limit 2)
-      (q/order-by [:user/email :desc])
+  (-> (q/order-by [:user/email :desc])
+      (q/limit 2)
       (q/all! :user))
   ;; => [#:user{:email "user-3@mail.com" ,,,}
   ;;     #:user{:email "user-2@mail.com" ,,,}]
   )
 
+;;
 ;; [Validators]
 ;;
 ;; Validators are extra, map wide validations. Since Malli fields are isolated
@@ -286,7 +235,8 @@
 ;; confirmation checks.
 
 (comment
-  (defmethod gungnir/model :user [_]
+  (gungnir.model/register!
+   {:user
     [:map
      [:user/id {:primary-key true} uuid?]
      [:user/email
@@ -295,116 +245,114 @@
      ;; >>> ADD `:user/password-confirmation`
      [:user/password-confirmation {:virtual true} [:string {:min 6}]]
      [:user/created-at {:auto true} inst?]
-     [:user/updated-at {:auto true} inst?]])
+     [:user/updated-at {:auto true} inst?]]})
 
   (defn- password-match? [m]
     (= (:user/password m)
        (:user/password-confirmation m)))
 
-  ;; Define Gungnir validator. Model `:user` and validator `:register/password-match?`
-  (defmethod gungnir/validator [:user :register/password-match?] [_ _]
-    {:validator/path [:user/password-confirmation]
+  ;; Define Gungnir validator named `:user/password-match?`
+  (defmethod gungnir.model/validator :user/password-match? [_]
+    {:validator/key :user/password-confirmation
      :validator/fn password-match?
      :validator/message "Passwords don't match"})
 
   (-> {:user/email "foo@bar.baz"
        :user/password "qweqwe"
        :user/password-confirmation "123123"}
-      (changeset [:register/password-match?])
+      (changeset [:user/password-match?])
       :changeset/errors)
   ;; => #:user{:password-confirmation ["Passwords don't match"]}
   )
 
-
+;;
 ;; [Hooks]
 ;;
 ;; Sometimes you want to modify certain fields before or after saving / reading
 ;; them. This can be done with the following hooks
 ;;
-;; * gungnir/before-save
+;; * gungnir.model/before-save
 ;;
 ;; Modify the column value before saving to the database.
 ;;
-;; * gungnir/on-read (TODO RENAME after-read)
+;; * gungnir.model/before-read (TODO RENAME after-read)
 ;;
 ;; Modify the column value after reading from the database.
 ;;
-;; * gungnir/before-read
+;; * gungnir.model/before-read
 ;;
 ;; Modify the column value before reading from the database.
 ;;
 
 (comment
-  (defmethod gungnir/model :user [_]
+  (gungnir.model/register!
+   {:user
     [:map
      [:user/id {:primary-key true} uuid?]
-     ;; >>> ADD `:on-save` `:before-read` hooks
+     ;; >>> ADD `:before-save` `:before-read` hooks
      ;; always lowercase `:user/email` when reading / writing
-     [:user/email {:on-save [:string/lower-case]
+     [:user/email {:before-save [:string/lower-case]
                    :before-read [:string/lower-case]}
       [:re {:error/message "Invalid email"} #".+@.+\..+"]]
      [:user/password [:string {:min 6}]]
      [:user/password-confirmation {:virtual true} [:string {:min 6}]]
      [:user/created-at {:auto true} inst?]
-     [:user/updated-at {:auto true} inst?]])
+     [:user/updated-at {:auto true} inst?]]})
 
   ;; Now regardless of uppercase / lowercase letters, emails will always be cast
-  ;; to lowercase. When writing and reading.
-  (-> {:user/email "SomE-UseR@mAiL.cOM" :user/password "qweqwe"} (changeset) (q/insert!))
+  ;; to lowercase when writing and reading.
+  (-> {:user/email "SomE-UseR@mAiL.cOM" :user/password "qweqwe"} (changeset) (q/save!))
   (q/find-by! :user/email "some-USER@MAIL.com")
   (q/find-by! :user/email "some-user@mail.com")
   ;;
   )
 
-
 ;; You can also create custom hooks. For example you'd never want to save a
 ;; password unencrypted to the database.
 
 (comment
-  (defmethod gungnir/model :user [_]
+  (gungnir.model/register!
+   {:user
     [:map
      [:user/id {:primary-key true} uuid?]
-     [:user/email {:on-save [:string/lower-case]
+     [:user/email {:before-save [:string/lower-case]
                    :before-read [:string/lower-case]}
       [:re {:error/message "Invalid email"} #".+@.+\..+"]]
-     ;; >>> ADD `:on-save` `:bcrypt'
-     [:user/password {:on-save [:bcrypt]} [:string {:min 6}]]
+     ;; >>> ADD `:before-save` `:bcrypt'
+     [:user/password {:before-save [:bcrypt]} [:string {:min 6}]]
      [:user/password-confirmation {:virtual true} [:string {:min 6}]]
      [:user/created-at {:auto true} inst?]
-     [:user/updated-at {:auto true} inst?]])
+     [:user/updated-at {:auto true} inst?]]})
 
-  ;; Define our custom `gungnir/on-save` hook. Where `v` is the value of the
+  ;; Define our custom `gungnir/before-save` hook. Where `v` is the value of the
   ;; column. Here we simple `buddy.hashers/derive` function to encrypt the value
-  (defmethod gungnir/on-save :bcrypt [_ v]
+  (defmethod gungnir.model/before-save :bcrypt [_ v]
     (hashers/derive v))
 
-  (-> {:user/email "encrypted@mail.com" :user/password "secret!"} (changeset) (q/insert!))
+  (-> {:user/email "encrypted@mail.com" :user/password "secret!"} (changeset) (q/save!))
   ;; => #:user{:password "bcrypt+sha512$387a0d10115bb66c98c2a4b908f77e1e,,," ,,,}
   )
 
-
-;; [Relations]
 ;;
+;; [Relations]
 ;;
 
 (comment
-  (defmethod gungnir/model :user [_]
+  (def model-user
     [:map
      ;; >>> ADD `:has-many` relation to `:post`
      {:has-many {:post :user/posts
                  :comment :user/comments}}
      [:user/id {:primary-key true} uuid?]
-     [:user/email {:on-save [:string/lower-case]
+     [:user/email {:before-save [:string/lower-case]
                    :before-read [:string/lower-case]}
       [:re {:error/message "Invalid email"} #".+@.+\..+"]]
-     [:user/password {:on-save [:bcrypt]} [:string {:min 6}]]
+     [:user/password {:before-save [:bcrypt]} [:string {:min 6}]]
      [:user/password-confirmation {:virtual true} [:string {:min 6}]]
      [:user/created-at {:auto true} inst?]
      [:user/updated-at {:auto true} inst?]])
 
-  ;; Define a `:post` model. We'll keep it simple. The only exceptional line
-  ;; here is the `:belongs-to` property.
-  (defmethod gungnir/model :post [_]
+  (def model-post
     [:map
      {:belongs-to {:user :post/user-id}
       :has-many {:comment :post/comments}}
@@ -415,7 +363,7 @@
      [:post/created-at {:auto true} inst?]
      [:post/updated-at {:auto true} inst?]])
 
-  (defmethod gungnir/model :comment [_]
+  (def model-comment
     [:map
      {:belongs-to {:user :comment/user-id
                    :post :comment/post-id}}
@@ -425,28 +373,31 @@
      [:comment/post-id uuid?]
      [:comment/created-at {:auto true} inst?]
      [:comment/updated-at {:auto true} inst?]])
-  ;;
-  )
+
+  (gungnir.model/register!
+   {:user model-user
+    :post model-post
+    :comment model-comment}))
 
 (defn create-user [email]
   (-> {:user/email email
        :user/password "qweqwe"}
       (changeset)
-      (q/insert!)))
+      (q/save!)))
 
 (defn create-comment [user-id post-id content]
   (-> {:comment/user-id user-id
        :comment/post-id post-id
        :comment/content content}
       (changeset)
-      (q/insert!)))
+      (q/save!)))
 
 (defn create-post [user-id title content]
   (-> {:post/user-id user-id
        :post/title title
        :post/content content}
       (changeset)
-      (q/insert!)))
+      (q/save!)))
 
 (defn create-user-with-posts-comments
   "Create a user with the email `email`, and create 3 posts that belong to that user."
@@ -474,7 +425,7 @@
       (deref))
 
   ;; Once again, Gungnir is based on HoneySQL, so we can modify the relational
-  ;; atom's query with `swap!`. For example let's say we wanted to limit it to
+  ;; atom's query using `swap!`. For example let's say we wanted to limit it to
   ;; two posts instead of all posts.
 
   (-> (q/find-by! :user/email "user-posts@mail.com")
@@ -483,6 +434,29 @@
       (deref)
       (count))
   ;; => 2
+
+
+  ;; Gungnir also provides a `q/load!` function which takes a record and any
+  ;; amount of relational keys. Gungnir will then deref those keys without
+  ;; taking them out of the record. Combined with `update` you could load the
+  ;; relations in the same map, but still modify the outcome easily.
+  (-> (q/find-by! :user/email "user-posts@mail.com")
+      (update :user/posts swap! q/limit 2)
+      (q/load! :user/posts))
+  ;; => #:user{:id #uuid "c2635659-5b72-4696-a58a-81a73c2c2f35"
+  ;; =>        :posts [#:post{,,,}
+  ;; =>                #:post{,,,}]
+  ;; =>        :comments <relation-atom>}
+
+
+  ;; Or load multiple relations at once
+  (-> (q/find-by! :user/email "user-posts@mail.com")
+      (q/load! :user/posts :user/comments))
+  ;; => #:user{:id #uuid "c2635659-5b72-4696-a58a-81a73c2c2f35"
+  ;; =>        :posts [#:post{,,,}
+  ;; =>                ,,,]
+  ;; =>        :comments [#:comment{,,,}
+  ;; =>                   ,,,]}
 
 
   ;; We can also go back from a post to the user it belongs to, the same way.
@@ -501,9 +475,4 @@
       (deref)
       (first)
       (:post/comments)
-      (deref))
-
-  ;; Get all comments of the user
-  (-> (q/find-by! :user/email "user-posts@mail.com")
-      :user/comments
       (deref)))
