@@ -3,9 +3,10 @@
    [buddy.hashers :as hashers]
    [ragtime.jdbc]
    [ragtime.repl]
-   [gungnir.changeset :refer [changeset]]
-   [gungnir.database :refer [make-datasource! *database*]]
+   [gungnir.changeset :as changeset]
+   [gungnir.database :refer [make-datasource! *datasource*]]
    [gungnir.query :as q]
+   [gungnir.migration]
    [gungnir.model]
    [ragtime.core]))
 
@@ -17,8 +18,8 @@
 ;; * JDBC_DATABASE_URL - The standard Java Database Connectivity URL
 ;; * HikariCP configuration map - https://github.com/tomekw/hikari-cp#configuration-options
 
-;; Gunir also has a `set-datasource!` function, if you want to create the
-;; datasource yoursef.
+;; Gungnir also has a `set-datasource!` function, if you want to create the
+;; datasource yourself.
 
 (def datasource-opts
   "Very simple HikariCP configuration map. Be sure to start the
@@ -31,11 +32,11 @@
    :username      "postgres"
    :password      "postgres"
    :database-name "postgres"
-   :server-name   "localhost"
+   :server-name   "127.0.0.1"
    :port-number   7432})
 
-;; Initialize the datasource.  Normally you'd want to manage this through a
-;; state manager like Integrant, Component, or Mount
+;; Initialize the datasource. Normally you'd want to manage this through a state
+;; manager like Integrant, Component, or Mount
 
 (comment
   (make-datasource! datasource-opts))
@@ -43,42 +44,37 @@
 ;;
 ;; [Migrations]
 ;;
-;; Currently Gungnir does not a built-in migrations tool (future feature). In
-;; this demo we'll use Ragtime.
-;;
 ;; Migrations are located in gungnir_playground/resources/migrations
 ;;
 ;; The following migrations will be run:
 ;; * Enable UUID
 ;; * Enable auto updating of the `updated_at` column
-;; * Create "user" table
+;; * Create "account" table
 ;; * Create "post" table
 ;; * Create "comment" table
 ;;
 ;; Relations
 ;; * comment belongs_to post
-;; * comment belongs_to user
-;; * post belongs_to user
+;; * comment belongs_to account
+;; * post belongs_to account
 ;; * post has_many comment
-;; * user has_many comment
-;; * user has_many post
+;; * account has_many comment
+;; * account has_many post
 
-(defn migrate! []
-  (ragtime.repl/migrate
-   {:datastore (ragtime.jdbc/sql-database {:datasource *database*})
-    :migrations (ragtime.jdbc/load-resources "migrations")}))
+(def migrations (gungnir.migration/load-resources "migrations"))
 
 (comment
   ;; Run the migrations
-  (migrate!))
+  (gungnir.migration/migrate! migrations)
+ )
 
 ;;
 ;; [Models]
 ;;
 ;; Now that we've defined our Postgresql database structure, we now need to
 ;; describe it to Gungnir. This is done using Malli schemas and the defmethod
-;; `gungnir/model`. Each table has their own model which describe their
-;; fields. Extra Gungnir specific model / field options can be added.
+;; `gungnir/model`. Each table has their own (or multiple) model which describe
+;; their fields. Extra Gungnir specific model / field options can be added.
 ;;
 ;; Field options:
 ;;
@@ -90,15 +86,20 @@
 ;; automatically. For example `created_at` and `updated_at`.
 
 (comment
+  ;; Notice how the model is called ":user" but the table it accesses is
+  ;; called "account". Gungnir allows you to do this because certain tables
+  ;; are restricted (e.g. postgres doesn 't allow you to create a "user"
+  ;; table).
   (gungnir.model/register!
    {:user
-    [:map
+    [:map {:table :account}
      [:user/id {:primary-key true} uuid?]
      [:user/email
       [:re {:error/message "Invalid email"} #".+@.+\..+"]]
      [:user/password [:string {:min 6}]]
      [:user/created-at {:auto true} inst?]
-     [:user/updated-at {:auto true} inst?]]}))
+     [:user/updated-at {:auto true} inst?]]})
+  ,)
 
 ;; [Changesets]
 ;;
@@ -112,12 +113,12 @@
 ;; a key `:changeset/errors` containing the failing key with an error message.
 
 (comment
-  (changeset {:user/email "foo@bar.baz"
-              :user/password "qweqw"})
+  (changeset/create {:user/email "foo@bar.baz"
+                     :user/password "qweqw"})
   ;; => #:changeset{:errors {:user/password ["should be at least 6 characters"]} ,,, }
 
-  (changeset {:user/email "foo@bar.baz"
-              :user/password "qweqwe"})
+  (changeset/create {:user/email "foo@bar.baz"
+                     :user/password "qweqwe"})
   ;; => #:changeset{:errors nil ,,, }
   )
 
@@ -150,13 +151,13 @@
 
 (comment
   (q/save!
-   (changeset {:user/email "foo@bar.baz"
-               :user/password "qweqw"}))
+   (changeset/create {:user/email "foo@bar.baz"
+                      :user/password "qweqw"}))
   ;; => #:changeset{:errors {:user/password ["should be at least 6 characters"]} ,,, }
 
   (q/save!
-   (changeset {:user/email "foo@bar.baz"
-               :user/password "qweqwe"}))
+   (changeset/create {:user/email "foo@bar.baz"
+                      :user/password "qweqwe"}))
   ;; => #:user{:id #uuid "a73b46cc-2848-4405-a819-b6e8738007ef",
   ;;           :email "foo@bar.baz",
   ;;           :password "qweqwe",
@@ -181,7 +182,7 @@
 ;; `table`. Or return an empty vector
 
 (comment
-  (q/find! :user #"insert-primary-key-of-user")
+  (q/find! :user "<primary-key-of-user>")
 
   (q/find-by! :user/email "foo@bar.baz")
   ;; => #:user{:email "foo@bar.baz" ,,,}
@@ -196,9 +197,9 @@
 
 (comment
   ;; Create 3 users
-  (-> {:user/email "user-1@mail.com" :user/password "qweqwe"} (changeset) (q/save!))
-  (-> {:user/email "user-2@mail.com" :user/password "qweqwe"} (changeset) (q/save!))
-  (-> {:user/email "user-3@mail.com" :user/password "qweqwe"} (changeset) (q/save!))
+  (-> {:user/email "user-1@mail.com" :user/password "qweqwe"} (changeset/create) (q/save!))
+  (-> {:user/email "user-2@mail.com" :user/password "qweqwe"} (changeset/create) (q/save!))
+  (-> {:user/email "user-3@mail.com" :user/password "qweqwe"} (changeset/create) (q/save!))
 
   ;; Note, using the `:user` table instead of key value pairs
   (-> (q/order-by [:user/email :desc])
@@ -238,6 +239,7 @@
   (gungnir.model/register!
    {:user
     [:map
+     {:table :account}
      [:user/id {:primary-key true} uuid?]
      [:user/email
       [:re {:error/message "Invalid email"} #".+@.+\..+"]]
@@ -260,7 +262,7 @@
   (-> {:user/email "foo@bar.baz"
        :user/password "qweqwe"
        :user/password-confirmation "123123"}
-      (changeset [:user/password-match?])
+      (changeset/create [:user/password-match?])
       :changeset/errors)
   ;; => #:user{:password-confirmation ["Passwords don't match"]}
   )
@@ -275,7 +277,7 @@
 ;;
 ;; Modify the column value before saving to the database.
 ;;
-;; * gungnir.model/before-read (TODO RENAME after-read)
+;; * gungnir.model/after-read
 ;;
 ;; Modify the column value after reading from the database.
 ;;
@@ -288,6 +290,7 @@
   (gungnir.model/register!
    {:user
     [:map
+     {:table :account}
      [:user/id {:primary-key true} uuid?]
      ;; >>> ADD `:before-save` `:before-read` hooks
      ;; always lowercase `:user/email` when reading / writing
@@ -301,7 +304,7 @@
 
   ;; Now regardless of uppercase / lowercase letters, emails will always be cast
   ;; to lowercase when writing and reading.
-  (-> {:user/email "SomE-UseR@mAiL.cOM" :user/password "qweqwe"} (changeset) (q/save!))
+  (-> {:user/email "SomE-UseR@mAiL.cOM" :user/password "qweqwe"} (changeset/create) (q/save!))
   (q/find-by! :user/email "some-USER@MAIL.com")
   (q/find-by! :user/email "some-user@mail.com")
   ;;
@@ -314,6 +317,7 @@
   (gungnir.model/register!
    {:user
     [:map
+     {:table :account}
      [:user/id {:primary-key true} uuid?]
      [:user/email {:before-save [:string/lower-case]
                    :before-read [:string/lower-case]}
@@ -329,7 +333,7 @@
   (defmethod gungnir.model/before-save :bcrypt [_ v]
     (hashers/derive v))
 
-  (-> {:user/email "encrypted@mail.com" :user/password "secret!"} (changeset) (q/save!))
+  (-> {:user/email "encrypted@mail.com" :user/password "secret!"} (changeset/create) (q/save!))
   ;; => #:user{:password "bcrypt+sha512$387a0d10115bb66c98c2a4b908f77e1e,,," ,,,}
   )
 
@@ -341,8 +345,9 @@
   (def model-user
     [:map
      ;; >>> ADD `:has-many` relation to `:post`
-     {:has-many {:post :user/posts
-                 :comment :user/comments}}
+     {:table :account
+      :has-many {:user/posts {:model :post :foreign-key :post/user-id}
+                 :user/comments {:model :comment :foreign-key :comment/user-id}}}
      [:user/id {:primary-key true} uuid?]
      [:user/email {:before-save [:string/lower-case]
                    :before-read [:string/lower-case]}
@@ -354,8 +359,8 @@
 
   (def model-post
     [:map
-     {:belongs-to {:user :post/user-id}
-      :has-many {:comment :post/comments}}
+     {:belongs-to {:post/user {:model :user :foreign-key :post/user-id}}
+      :has-many {:post/comments {:model :comment :foreign-key :comment/post-id}}}
      [:post/id {:primary-key true} uuid?]
      [:post/title string?]
      [:post/content string?]
@@ -365,8 +370,8 @@
 
   (def model-comment
     [:map
-     {:belongs-to {:user :comment/user-id
-                   :post :comment/post-id}}
+     {:belongs-to {:comment/user {:model :user :foreign-key :comment/user-id}
+                   :comment/post {:model :post :foreign-key :comment/post-id}}}
      [:comment/id {:primary-key true} uuid?]
      [:comment/content string?]
      [:comment/user-id uuid?]
@@ -382,21 +387,21 @@
 (defn create-user [email]
   (-> {:user/email email
        :user/password "qweqwe"}
-      (changeset)
+      (changeset/create)
       (q/save!)))
 
 (defn create-comment [user-id post-id content]
   (-> {:comment/user-id user-id
        :comment/post-id post-id
        :comment/content content}
-      (changeset)
+      (changeset/create)
       (q/save!)))
 
 (defn create-post [user-id title content]
   (-> {:post/user-id user-id
        :post/title title
        :post/content content}
-      (changeset)
+      (changeset/create)
       (q/save!)))
 
 (defn create-user-with-posts-comments

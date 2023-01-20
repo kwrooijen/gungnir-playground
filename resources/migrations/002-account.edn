@@ -1,0 +1,8 @@
+{:up
+ [[:table/create {:table :account :primary-key :uuid}
+   [:column/add
+    [:email {:unique true} :string]
+    [:password :string]
+    [:gungnir/timestamps]]]]
+ :down
+ [[:table/drop :account]]}

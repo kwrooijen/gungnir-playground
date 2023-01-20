@@ -1,10 +1,8 @@
 {:up
- ["CREATE TABLE IF NOT EXISTS \"post\"
-  ( id uuid DEFAULT uuid_generate_v4 () PRIMARY KEY
-  , title TEXT
-  , content TEXT
-  , user_id uuid references \"user\"(id)
-  , created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
-  , updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
-  );"]
- :down ["DROP TABLE \"post\""]}
+ [[:table/create {:table :post :primary-key :uuid}
+   [:column/add
+    [:title :string]
+    [:content :string]
+    [:user_id {:references :account/id} :uuid]]]]
+ :down
+ [[:table/drop :post]]}
